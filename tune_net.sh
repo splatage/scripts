@@ -15,10 +15,10 @@ do
 
 
 	echo "Interrupt Coalesce"
-    ethtool -C ${IFACE} adaptive-rx off
-    ethtool -C ${IFACE} adaptive-tx off
-	  ethtool -C ${IFACE} rx-usecs 5 tx-usecs 10 tx-frames 0
-    ethtool -c ${IFACE}
+        ethtool -C ${IFACE} adaptive-rx off
+        ethtool -C ${IFACE} adaptive-tx off
+        ethtool -C ${IFACE} rx-usecs 5 tx-usecs 10 tx-frames 0
+        ethtool -c ${IFACE}
 
 	echo "Attempting to activate Flow Control"
 	ethtool -A ${IFACE} rx on
@@ -28,8 +28,8 @@ do
 	echo "Checksum Offloading"
 	ethtool -K ${IFACE} tx-checksum-ipv4 on
 	ethtool -K ${IFACE} tx-checksum-ipv6 on
-    ethtool -K ${IFACE} tso off
-    ethtool -k ${IFACE}
+        ethtool -K ${IFACE} tso off
+        ethtool -k ${IFACE}
 
 	echo "Setting TXQueuelen"
 	ip link set txqueuelen 500 dev ${IFACE}
