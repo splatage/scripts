@@ -4,4 +4,4 @@
     }
     history.scrollRestoration = "manual";
     window.onload = scrollToBottom;
-</script
+</script>
