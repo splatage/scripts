@@ -5,3 +5,27 @@
     history.scrollRestoration = "manual";
     window.onload = scrollToBottom;
 </script>
+
+
+
+CPU:
+mpstats -P ALL
+
+MEMORY:
+vmstat -wd
+
+
+Interfaces – need to read ifaces
+vnstat -d -i eno1+eno2
+
+CURRENT EXTERNAL CONNECTIONS
+Handles dnsdomainname not working – queries the local dns server and filters out local connections:
+
+ss -utrs | awk '$6 !~ /'"$(dig +short -x $(hostname -I | awk '{print $1}') | awk -F. '{print $2}' )"'|^[ \t]*$|localhost/ {print $6}'
+
+disk
+iostat
+df -h
+
+
+
