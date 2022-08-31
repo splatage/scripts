@@ -25,6 +25,7 @@ Handles dnsdomainname not working – queries the local dns server and filters o
 
 ss -utrs | awk '$6 !~ /'"$(dig +short -x $(hostname -I | awk '{print $1}') | awk -F. '{print $2}' )"'|^[ \t]*$|localhost/ {print $6}'
 ss -utrs | awk -F'[ :]*' '$7 !~ /'"$(dig +short -x $(hostname -I | awk '{print $1}') | awk -F. '{print $2}' )"'|^[ \t]*$|localhost/ {print $6, " <=> ", $7":"$8}'
+ss -Hturp | awk -F'[ :]*' '$7 !~ /'"$(dig +short -x $(hostname -I | awk '{print $1}') | awk -F. '{print $2}' )"'|^[ \t]*$|localhost/ {print $6" "$7" "$8}'
 
 DISK INFO:
 iostat
