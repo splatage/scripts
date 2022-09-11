@@ -31,5 +31,6 @@ DISK INFO:
 iostat
 df -h $(pwd)
 
-
+# Clean up chunks
+ls | sed '/r\.\([-]*[0-9]\)\{1\}\.\([-]*[0-9]\)\{1\}\.mca/d' | xargs rm
 
