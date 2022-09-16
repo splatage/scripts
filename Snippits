@@ -34,3 +34,6 @@ df -h $(pwd)
 # Clean up chunks
 ls | sed '/r\.\([-]*[0-9]\)\{1\}\.\([-]*[0-9]\)\{1\}\.mca/d' | xargs rm
 
+
+s/\x1b[[()=][;?0-9]*[0-9A-Za-z]?//g;s/\r//g;s/\007//g;print
+
