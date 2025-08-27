@@ -1,24 +1,22 @@
 #!/bin/bash
 # setup-fan-service.sh
-# One-shot installer: fan control (IBM + Dell R720), Prometheus export, systemd service.
-# - Preserves your IBM logic/values/thresholds AS-IS
-# - Adds Dell R720 OEM control with auto/manual toggle and percent→hex mapping
-# - Exposes Prometheus textfile metrics
-# - Locks to a single instance
-# - Auto-detects 1 vs 2 CPUs (same as before)
+# Installs a target-temp (PI) fan controller with a quiet cap, Prometheus export, and a systemd service.
+# - IBM path: per-bank hex steps (your original mapping preserved)
+# - Dell/Unisys R720-class: global % duty (0x00–0x64) with manual/auto toggle
+# - Sensors: explicit by LABEL or SDR ID (no fuzzy guessing)
+# - Control: target temp with deadband, slew limit, min/max caps
+# - Quiet cap: keep PWM ≤ LOW_CAP_MAX_PCT while hottest CPU < LOW_CAP_C
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# --- Paths / constants ---
 FAN_SCRIPT_PATH="/usr/local/sbin/fan_control.sh"
 SERVICE_NAME="fan-control.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 METRICS_DIR="/var/lib/node_exporter/textfile_collector"
 METRICS_FILE="${METRICS_DIR}/fan_control.prom"
-INTERVAL_SECS=30
 
-echo "[1/7] Ensuring dependencies..."
+echo "[1/5] Ensuring prerequisites..."
 need_pkgs=()
 command -v ipmitool >/dev/null 2>&1 || need_pkgs+=(ipmitool)
 command -v dmidecode >/dev/null 2>&1 || need_pkgs+=(dmidecode)
@@ -27,310 +25,296 @@ if ((${#need_pkgs[@]})); then
     apt-get update -y
     apt-get install -y "${need_pkgs[@]}"
   else
-    echo "Missing: ${need_pkgs[*]} (and apt-get unavailable). Install them and re-run."
+    echo "Missing: ${need_pkgs[*]} (and apt-get unavailable). Install them and re-run." >&2
     exit 1
   fi
 fi
 
-echo "[2/7] Creating Prometheus textfile collector path: ${METRICS_DIR}"
+echo "[2/5] Preparing Prometheus textfile collector path: ${METRICS_DIR}"
 mkdir -p "${METRICS_DIR}"
 chmod 755 "${METRICS_DIR}"
 
-echo "[3/7] Installing unified fan control script to ${FAN_SCRIPT_PATH}"
+echo "[3/5] Installing ${FAN_SCRIPT_PATH}"
 install -m 0755 /dev/stdin "${FAN_SCRIPT_PATH}" <<'FANEOF'
 #!/bin/bash
-# fan_control.sh
-# Unified: IBM (source-of-truth logic preserved) + Dell R720 (OEM RAW control)
-# Adds: platform detection, Prometheus metrics, lockfile, --once/--interval flags
+# fan_control.sh — target-temp PI controller with IBM/Dell paths + quiet cap
+# See systemd unit for environment overrides.
 
 set -o errexit -o nounset -o pipefail
 IFS=$'\n\t'
 
-# --- CLI flags ---
-INTERVAL=30
-RUN_ONCE=0
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --once) RUN_ONCE=1 ;;
-    --interval) shift; INTERVAL="${1:-30}" ;;
-    *) echo "Unknown arg: $1"; exit 2 ;;
-  esac
-  shift
-done
+# ---------------- Env-configurable knobs ----------------
+# Vendor path: "ibm" or "dell" (auto-detect if unset)
+VENDOR="${FANCTL_VENDOR:-}"
 
-# ---------------- IBM (as provided) ----------------
-# Fan speed levels (hexadecimal values) — IBM path uses these fixed steps
-FAN_SPEED_0=0x12    # 0% fan speed
-FAN_SPEED_25=0x30   # 25% fan speed
-FAN_SPEED_30=0x35   # 30% fan speed
-FAN_SPEED_35=0x3A   # 35% fan speed
-FAN_SPEED_40=0x40   # 40% fan speed
-FAN_SPEED_50=0x50   # 50% fan speed
-FAN_SPEED_60=0x60   # 60% fan speed
-FAN_SPEED_70=0x70   # 70% fan speed
-FAN_SPEED_80=0x80   # 80% fan speed
-FAN_SPEED_90=0x90   # 90% fan speed
-FAN_SPEED_100=0xFF  # 100% fan speed (maximum)
+# Sensors: prefer SDR IDs on platforms with duplicate/generic labels (e.g., Unisys)
+CPU1_ID="${FANCTL_CPU1_SDR_ID:-}"
+CPU2_ID="${FANCTL_CPU2_SDR_ID:-}"
+CPU1_LABEL="${FANCTL_CPU1_LABEL:-CPU 1 Temp}"
+CPU2_LABEL="${FANCTL_CPU2_LABEL:-CPU 2 Temp}"
 
-# Temperature thresholds (degrees Celsius) — preserved
-TEMP_40=40
-TEMP_45=45
-TEMP_50=50
-TEMP_55=55
-TEMP_60=60
-TEMP_65=65
-TEMP_70=70
-TEMP_75=75
-TEMP_80=80
-TEMP_85=85
-TEMP_90=90
-TEMP_95=95
-TEMP_100=100
+# Control loop
+INTERVAL="${FANCTL_INTERVAL:-30}"      # seconds between loops
+TARGET_C="${FANCTL_TARGET_C:-65}"      # desired CPU temperature (°C) — Xeon E5 under 70°C is OK
+DEADBAND_C="${FANCTL_DEADBAND_C:-2}"   # ±°C around target where we back off
+MIN_PCT="${FANCTL_MIN_PCT:-10}"        # min PWM %
+MAX_PCT="${FANCTL_MAX_PCT:-80}"        # max PWM %
+KP="${FANCTL_KP:-3}"                   # proportional gain: % per °C
+KI_mPct_per_s="${FANCTL_KI_MILLI:-0}"  # integral gain (milli-% per °C per second). 0 = off
+SLEW_PCT="${FANCTL_SLEW_PCT:-6}"       # max % change per loop
 
-# Cache + metrics files
+# Quiet cap (acoustics): hold duty low while cool
+LOW_CAP_C="${FANCTL_LOW_CAP_C:-50}"             # lift cap once hottest CPU ≥ this temp (°C)
+LOW_CAP_MAX_PCT="${FANCTL_LOW_CAP_MAX_PCT:-15}" # max % allowed below LOW_CAP_C
+# Tip: ensure MIN_PCT <= LOW_CAP_MAX_PCT for the cap to have effect.
+
+# ---------------- IBM hex steps (preserved from your original) ----------------
+FAN_SPEED_0=0x12
+FAN_SPEED_25=0x30
+FAN_SPEED_30=0x35
+FAN_SPEED_35=0x3A
+FAN_SPEED_40=0x40
+FAN_SPEED_50=0x50
+FAN_SPEED_60=0x60
+FAN_SPEED_70=0x70
+FAN_SPEED_80=0x80
+FAN_SPEED_90=0x90
+FAN_SPEED_95=0xA0
+FAN_SPEED_100=0xFF
+
+# ---------------- Files ----------------
 IPMI_CACHE_FILE="/tmp/ipmi_temperature_cache.txt"
-METRICS_DIR="/var/lib/node_exporter/textfile_collector"
-METRICS_FILE="${METRICS_DIR}/fan_control.prom"
+METRICS_FILE="/var/lib/node_exporter/textfile_collector/fan_control.prom"
+LOCK="/tmp/fan_control.lock"
 
-# Lockfile to avoid multiple instances
-LOCK=/tmp/fan_control.lock
+# ---------------- Single-instance lock ----------------
 exec 9>"$LOCK"
 if ! flock -n 9; then
   echo "Another fan_control instance is running. Exiting."
   exit 0
 fi
 
-# ---------- Platform detection ----------
-# Prefer dmidecode; fallback to ipmitool FRU/MC if needed.
-detect_vendor() {
-  local v=""
-  if command -v dmidecode >/dev/null 2>&1; then
-    v="$(dmidecode -s system-manufacturer 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
-  fi
-  if [[ -z "$v" ]]; then
-    v="$(ipmitool mc info 2>/dev/null | awk -F: '/Manufacturer Name/{print tolower($2)}' | xargs || true)"
-  fi
-  if echo "$v" | grep -q "dell"; then
-    echo "dell"
-  elif echo "$v" | grep -Eiq "ibm|lenovo"; then
-    echo "ibm"
+# ---------------- Vendor detect (simple) ----------------
+detect_vendor_simple() {
+  local man prod base
+  man="$(dmidecode -s system-manufacturer 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  prod="$(dmidecode -s system-product-name 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  base="$(dmidecode -s baseboard-manufacturer 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  local s="${man} ${base} ::: ${prod}"
+  if echo "$s" | grep -Eq 'dell|emc|unisys'; then
+    echo dell
+  elif echo "$s" | grep -Eq 'ibm|lenovo'; then
+    echo ibm
   else
-    # Default to ibm behavior (your current production)
-    echo "ibm"
+    echo ibm
   fi
 }
+if [[ -z "$VENDOR" ]]; then VENDOR="$(detect_vendor_simple)"; fi
+echo "Vendor path: ${VENDOR}"
 
-PLATFORM="$(detect_vendor)"
-echo "Detected platform: ${PLATFORM}"
+# ---------------- IPMI helpers ----------------
+fetch_ipmi_data() { ipmitool sdr type temperature > "$IPMI_CACHE_FILE"; }
 
-# ---------- Shared helpers ----------
-fetch_ipmi_data() {
-  ipmitool sdr type temperature > "$IPMI_CACHE_FILE"
+# Read temp by SDR ID (2nd column like "0Eh"). Returns integer °C or empty.
+get_temp_by_sdr_id() {
+  local id="$1"
+  awk -F'|' -v id="$id" 'BEGIN{IGNORECASE=1}
+    $2 ~ id { gsub(/[^0-9.]/,"",$5); if($5!="") print int($5+0) }' "$IPMI_CACHE_FILE" | head -n1
+}
+# Read temp by label (1st column, exact match). Returns integer °C or empty.
+get_temp_by_label() {
+  local label="$1"
+  awk -F'|' -v lab="$label" '$1==lab { gsub(/[^0-9.]/,"",$5); if($5!="") print int($5+0) }' "$IPMI_CACHE_FILE" | head -n1
 }
 
-get_cpu_temperature() {
-  local label=$1
-  # Keep your original parsing: field 5 numeric
-  grep -w "$label" "$IPMI_CACHE_FILE" | awk -F'|' '{print $5}' | sed 's/[^0-9.]//g'
-}
-
-calculate_fan_speed() {
-  local temp=$1
-  if (( temp < TEMP_40 )); then
-    echo 0
-  elif (( temp < TEMP_45 )); then
-    echo 25
-  elif (( temp < TEMP_50 )); then
-    echo 30
-  elif (( temp < TEMP_55 )); then
-    echo 35
-  elif (( temp < TEMP_60 )); then
-    echo 40
-  elif (( temp < TEMP_65 )); then
-    echo 50
-  elif (( temp < TEMP_70 )); then
-    echo 60
-  elif (( temp < TEMP_75 )); then
-    echo 70
-  elif (( temp < TEMP_80 )); then
-    echo 80
-  elif (( temp < TEMP_85 )); then
-    echo 90
-  elif (( temp < TEMP_90 )); then
-    echo 95
-  else
-    echo 100
-  fi
-}
-
-display_status() {
-  local cpu1_temp=$1
-  local cpu2_temp=$2
-  local fan1_speed=$3
-  local fan2_speed=$4
-
-  echo "----------------------------------"
-  echo "Fan Control Status"
-  echo "----------------------------------"
-  echo "CPU 1 Temperature: $cpu1_temp°C"
-  echo "CPU 2 Temperature: $cpu2_temp°C"
-  echo "Fan Bank CPU 1: Speed $fan1_speed%"
-  echo "Fan Bank CPU 2: Speed $fan2_speed%"
-  echo "----------------------------------"
-  echo "Last updated: $(date +"%Y-%m-%d %H:%M:%S")"
-  echo "----------------------------------"
-}
-
-write_metrics() {
-  umask 022
-  local tmp="${METRICS_FILE}.tmp"
-  {
-    [[ -n "${CPU1_TEMP:-}" && "${CPU1_TEMP:-N/A}" != "N/A" ]] && echo "fanctl_cpu1_temp_c ${CPU1_TEMP}"
-    [[ -n "${CPU2_TEMP:-}" && "${CPU2_TEMP:-N/A}" != "N/A" ]] && echo "fanctl_cpu2_temp_c ${CPU2_TEMP}"
-    [[ -n "${FAN_SPEED_CPU1:-}" && "${FAN_SPEED_CPU1:-N/A}" != "N/A" ]] && echo "fanctl_fan1_pct ${FAN_SPEED_CPU1}"
-    [[ -n "${FAN_SPEED_CPU2:-}" && "${FAN_SPEED_CPU2:-N/A}" != "N/A" ]] && echo "fanctl_fan2_pct ${FAN_SPEED_CPU2}"
-    echo "fanctl_interval_seconds ${INTERVAL}"
-    echo "fanctl_up 1"
-    echo "fanctl_platform{vendor=\"${PLATFORM}\"} 1"
-  } > "$tmp" && mv "$tmp" "$METRICS_FILE"
-}
-
-# ---------- IBM path (your existing approach) ----------
+# ---------------- Percent/Hex mapping ----------------
+# For IBM, quantize UP to nearest supported step (safer than rounding down).
 hex_for_pct_ibm() {
-  case "$1" in
-    0) echo $FAN_SPEED_0 ;;
-    25) echo $FAN_SPEED_25 ;;
-    30) echo $FAN_SPEED_30 ;;
-    35) echo $FAN_SPEED_35 ;;
-    40) echo $FAN_SPEED_40 ;;
-    50) echo $FAN_SPEED_50 ;;
-    60) echo $FAN_SPEED_60 ;;
-    70) echo $FAN_SPEED_70 ;;
-    80) echo $FAN_SPEED_80 ;;
-    90) echo $FAN_SPEED_90 ;;
-    95) echo 0xA0 ;;
-    100) echo $FAN_SPEED_100 ;;
-    *) echo $FAN_SPEED_40 ;; # default
-  esac
+  local p=$1
+  if   (( p <= 0  )); then echo $FAN_SPEED_0
+  elif (( p <= 25 )); then echo $FAN_SPEED_25
+  elif (( p <= 30 )); then echo $FAN_SPEED_30
+  elif (( p <= 35 )); then echo $FAN_SPEED_35
+  elif (( p <= 40 )); then echo $FAN_SPEED_40
+  elif (( p <= 50 )); then echo $FAN_SPEED_50
+  elif (( p <= 60 )); then echo $FAN_SPEED_60
+  elif (( p <= 70 )); then echo $FAN_SPEED_70
+  elif (( p <= 80 )); then echo $FAN_SPEED_80
+  elif (( p <= 90 )); then echo $FAN_SPEED_90
+  elif (( p <= 95 )); then echo $FAN_SPEED_95
+  else                    echo $FAN_SPEED_100
+  fi
+}
+pct_to_hex() { local p=$1; ((p<0))&&p=0; ((p>100))&&p=100; printf "0x%02x" "$p"; }
+
+# ---------------- Command writers ----------------
+# IBM per-bank
+ibm_set_bank_pct() {
+  local bank="$1" pct="$2"
+  local hx; hx="$(hex_for_pct_ibm "$pct")"
+  ipmitool raw 0x3a 0x07 "$bank" "$hx" 0x01 >/dev/null
 }
 
-set_fan_speed_ibm() {
-  local fan_bank="$1" pct="$2"
-  local hex_speed
-  hex_speed="$(hex_for_pct_ibm "$pct")"
-  # Your existing RAW: bank + hex map
-  ipmitool raw 0x3a 0x07 "$fan_bank" "$hex_speed" 0x01 >/dev/null
+# Dell/Unisys global with manual/auto
+dell_manual=0
+dell_enter_manual() { ipmitool raw 0x30 0x30 0x01 0x00 >/dev/null || true; dell_manual=1; }
+dell_restore_auto() { ipmitool raw 0x30 0x30 0x01 0x01 >/dev/null || true; }
+dell_set_pct() {
+  local pct="$1"; local hx; hx="$(pct_to_hex "$pct")"
+  ipmitool raw 0x30 0x30 0x02 0xff "$hx" >/dev/null
 }
 
-# ---------- Dell R720 path (from your dev script) ----------
-# Dell requires manual mode before setting duty; restore auto on exit.
-DELL_MANUAL_SET=0
-
-dell_enable_auto() {
-  ipmitool raw 0x30 0x30 0x01 0x01 >/dev/null || true
-}
-
-dell_disable_auto() {
-  ipmitool raw 0x30 0x30 0x01 0x00 >/dev/null
-}
-
-pct_to_hex_dell() {
-  # Clamp 0..100 then print 0x00..0x64
-  local p="$1"
-  (( p < 0 )) && p=0
-  (( p > 100 )) && p=100
-  printf "0x%02x" "${p}"
-}
-
-set_fan_speed_dell() {
-  local _fan_bank_unused="$1" pct="$2"
-  # Dell raw ignores bank; single global duty. Sequence:
-  #  - Manual mode already set by dell_disable_auto()
-  #  - Set duty: ipmitool raw 0x30 0x30 0x02 0xff <duty_hex>
-  local duty_hex
-  duty_hex="$(pct_to_hex_dell "$pct")"
-  ipmitool raw 0x30 0x30 0x02 0xff "${duty_hex}" >/dev/null
-}
-
-# Ensure we restore auto on exit for Dell
 cleanup() {
-  if [[ "${PLATFORM}" == "dell" && "${DELL_MANUAL_SET}" -eq 1 ]]; then
-    echo "Restoring Dell auto fan control..."
-    dell_enable_auto
+  if [[ "$VENDOR" == "dell" && $dell_manual -eq 1 ]]; then
+    echo "Restoring auto fan control..."; dell_restore_auto
   fi
 }
 trap cleanup EXIT INT TERM
 
-# Platform-agnostic dispatcher
-set_fan_speed_platform() {
-  local fan_bank="$1" pct="$2"
-  if [[ "${PLATFORM}" == "dell" ]]; then
-    # Enter manual once
-    if [[ "${DELL_MANUAL_SET}" -eq 0 ]]; then
-      echo "Switching Dell to manual fan control..."
-      dell_disable_auto
-      DELL_MANUAL_SET=1
+# ---------------- PI Controller ----------------
+LAST1=0; LAST2=0; LASTG=0
+IERR1=0; IERR2=0; IERRG=0
+
+clamp() { local v=$1 lo=$2 hi=$3; (( v<lo )) && v=$lo; (( v>hi )) && v=$hi; echo "$v"; }
+
+# compute_next_pct temp last% IERR_REF
+compute_next_pct() {
+  local temp="$1" last="$2" ierr_ref="$3"  # name of integral variable (IERR1/IERR2/IERRG)
+  local err=$(( temp - TARGET_C ))
+  local abs_err=${err#-}
+
+  # Deadband: gently drift toward MIN
+  if (( abs_err <= DEADBAND_C )); then
+    local down=$(( last - 1 ))
+    last="$(clamp "$down" "$MIN_PCT" "$MAX_PCT")"
+    # Quiet cap
+    if (( temp < LOW_CAP_C )) && (( last > LOW_CAP_MAX_PCT )); then
+      last="$LOW_CAP_MAX_PCT"
     fi
-    set_fan_speed_dell "$fan_bank" "$pct"
-  else
-    set_fan_speed_ibm "$fan_bank" "$pct"
+    printf "%d\n" "$last"; return
   fi
+
+  # Proportional
+  local pterm=$(( KP * err ))
+
+  # Integral (milli-%)
+  local add_milli=$(( KI_mPct_per_s * err * INTERVAL ))
+  local cur_i; eval "cur_i=\${$ierr_ref}"
+  cur_i=$(( cur_i + add_milli ))
+  local i_clamp=$(( MAX_PCT*1000 ))
+  (( cur_i >  i_clamp )) && cur_i=$i_clamp
+  (( cur_i < -i_clamp )) && cur_i=-i_clamp
+  eval "$ierr_ref=$cur_i"
+  local iterm=$(( cur_i / 1000 ))
+
+  # Raw target
+  local want=$(( last + pterm + iterm ))
+  want="$(clamp "$want" "$MIN_PCT" "$MAX_PCT")"
+
+  # Slew limit
+  local delta=$(( want - last ))
+  if   (( delta >  SLEW_PCT )); then want=$(( last + SLEW_PCT ))
+  elif (( delta < -SLEW_PCT )); then want=$(( last - SLEW_PCT ))
+  fi
+  want="$(clamp "$want" "$MIN_PCT" "$MAX_PCT")"
+
+  # Quiet cap (below threshold)
+  if (( temp < LOW_CAP_C )) && (( want > LOW_CAP_MAX_PCT )); then
+    want="$LOW_CAP_MAX_PCT"
+  fi
+
+  printf "%d\n" "$want"
 }
 
-# ---------- Main loop ----------
+# ---------------- Main ----------------
+if [[ "$VENDOR" == "dell" ]]; then
+  echo "Entering manual fan control (Dell-class)..."; dell_enter_manual
+fi
+
 while true; do
   echo "Fetching IPMI data..."
   if ! fetch_ipmi_data; then
-    echo "Failed to fetch IPMI data. Retrying..."
-    sleep 10
-    continue
+    echo "Failed to fetch IPMI data. Retrying..."; sleep 10; continue
   fi
 
-  echo "Processing... (fetching temperatures and adjusting fan speeds)"
-  sleep 10
+  # Read temps
+  CPU1_TEMP=""; CPU2_TEMP=""
+  if [[ -n "$CPU1_ID" ]]; then CPU1_TEMP="$(get_temp_by_sdr_id "$CPU1_ID" || true)"; else CPU1_TEMP="$(get_temp_by_label "$CPU1_LABEL" || true)"; fi
+  if [[ -n "$CPU2_ID" ]]; then CPU2_TEMP="$(get_temp_by_sdr_id "$CPU2_ID" || true)"; else CPU2_TEMP="$(get_temp_by_label "$CPU2_LABEL" || true)"; fi
 
-  # Auto-detect sensors (only control CPUs that exist)
-  CPU1_TEMP="$(get_cpu_temperature "CPU 1 Temp" || true)"
-  CPU2_TEMP="$(get_cpu_temperature "CPU 2 Temp" || true)"
-
-  if [[ -z "${CPU1_TEMP}" && -z "${CPU2_TEMP}" ]]; then
-    echo "No CPU temperature sensors found. Retrying..."
-    sleep 10
-    continue
+  if [[ -z "$CPU1_TEMP" && -z "$CPU2_TEMP" ]]; then
+    echo "No CPU temperature readings (check labels/IDs). Retrying..."; sleep 10; continue
   fi
 
-  if [[ -n "${CPU1_TEMP}" ]]; then
-    FAN_SPEED_CPU1="$(calculate_fan_speed "${CPU1_TEMP}")"
-    # IBM maps CPU1→bank 0x01. Dell ignores bank; we still pass one.
-    set_fan_speed_platform 0x01 "${FAN_SPEED_CPU1}"
+  if [[ "$VENDOR" == "ibm" ]]; then
+    # Per-bank control
+    if [[ -n "$CPU1_TEMP" ]]; then
+      LAST1="$(compute_next_pct "$CPU1_TEMP" "$LAST1" IERR1)"
+      ibm_set_bank_pct 0x01 "$LAST1"
+    fi
+    if [[ -n "$CPU2_TEMP" ]]; then
+      LAST2="$(compute_next_pct "$CPU2_TEMP" "$LAST2" IERR2)"
+      ibm_set_bank_pct 0x02 "$LAST2"
+    fi
   else
-    FAN_SPEED_CPU1="N/A"
+    # Global (Dell/Unisys): regulate to hottest CPU
+    HOT=$(( ${CPU1_TEMP:-0} > ${CPU2_TEMP:-0} ? ${CPU1_TEMP:-0} : ${CPU2_TEMP:-0} ))
+    LASTG="$(compute_next_pct "$HOT" "$LASTG" IERRG)"
+    dell_set_pct "$LASTG"
   fi
 
-  if [[ -n "${CPU2_TEMP}" ]]; then
-    FAN_SPEED_CPU2="$(calculate_fan_speed "${CPU2_TEMP}")"
-    set_fan_speed_platform 0x02 "${FAN_SPEED_CPU2}"
+  # Status
+  echo "----------------------------------"
+  echo "Fan Control (target=${TARGET_C}°C, deadband=±${DEADBAND_C}°C, min=${MIN_PCT}%, max=${MAX_PCT}%)"
+  echo "Quiet cap: ≤${LOW_CAP_MAX_PCT}% while hot_cpu < ${LOW_CAP_C}°C"
+  echo "CPU 1 (${CPU1_ID:-$CPU1_LABEL}): ${CPU1_TEMP:-N/A}°C"
+  echo "CPU 2 (${CPU2_ID:-$CPU2_LABEL}): ${CPU2_TEMP:-N/A}°C"
+  if [[ "$VENDOR" == "ibm" ]]; then
+    echo "Applied IBM per-bank: Bank1=${LAST1}% Bank2=${LAST2}%"
   else
-    FAN_SPEED_CPU2="N/A"
+    echo "Applied Dell global: ${LASTG}% (hot=${HOT}°C)"
   fi
+  echo "Last updated: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "----------------------------------"
 
-  display_status "${CPU1_TEMP:-N/A}" "${CPU2_TEMP:-N/A}" "${FAN_SPEED_CPU1:-N/A}" "${FAN_SPEED_CPU2:-N/A}"
-  write_metrics
+  # Metrics
+  umask 022
+  {
+    [[ -n "$CPU1_TEMP" ]] && echo "fanctl_cpu1_temp_c ${CPU1_TEMP}"
+    [[ -n "$CPU2_TEMP" ]] && echo "fanctl_cpu2_temp_c ${CPU2_TEMP}"
+    echo "fanctl_target_c ${TARGET_C}"
+    echo "fanctl_deadband_c ${DEADBAND_C}"
+    echo "fanctl_min_pct ${MIN_PCT}"
+    echo "fanctl_max_pct ${MAX_PCT}"
+    echo "fanctl_kp ${KP}"
+    echo "fanctl_ki_milli ${KI_mPct_per_s}"
+    echo "fanctl_slew_pct ${SLEW_PCT}"
+    echo "fanctl_low_cap_c ${LOW_CAP_C}"
+    echo "fanctl_low_cap_max_pct ${LOW_CAP_MAX_PCT}"
+    if [[ "$VENDOR" == "ibm" ]]; then
+      echo "fanctl_fan1_pct ${LAST1}"
+      echo "fanctl_fan2_pct ${LAST2}"
+    else
+      echo "fanctl_fan_global_pct ${LASTG}"
+    fi
+    echo "fanctl_vendor{vendor=\"${VENDOR}\"} 1"
+    echo "fanctl_interval_seconds ${INTERVAL}"
+    echo "fanctl_up 1"
+  } > "${METRICS_FILE}.tmp" && mv "${METRICS_FILE}.tmp" "${METRICS_FILE}"
 
-  echo "Waiting ${INTERVAL} seconds before the next probe..."
-  [[ "${RUN_ONCE}" -eq 1 ]] && exit 0 || sleep "${INTERVAL}"
+  sleep "${INTERVAL}"
 done
 FANEOF
 
-echo "[4/7] Creating systemd service at ${SERVICE_PATH}"
+echo "[4/5] Creating systemd service at ${SERVICE_PATH}"
 cat > "${SERVICE_PATH}" <<SERVICEEOF
 [Unit]
-Description=Unified Fan Control (IBM + Dell R720) with Prometheus export
+Description=Target-temp Fan Control (IBM per-bank / Dell global) + Prometheus export
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${FAN_SCRIPT_PATH} --interval ${INTERVAL_SECS}
+ExecStart=${FAN_SCRIPT_PATH}
 Restart=always
 RestartSec=5
 User=root
@@ -339,21 +323,43 @@ ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 
+# -------- Optional tuning (uncomment & adjust) --------
+# Vendor (auto-detect if unset)
+#Environment=FANCTL_VENDOR=ibm
+#Environment=FANCTL_VENDOR=dell
+
+# IBM labels (typical):
+#Environment=FANCTL_CPU1_LABEL=CPU\ 1\ Temp
+#Environment=FANCTL_CPU2_LABEL=CPU\ 2\ Temp
+
+# Dell/Unisys (use SDR IDs to disambiguate generic "Temp"):
+#Environment=FANCTL_CPU1_SDR_ID=0Eh
+#Environment=FANCTL_CPU2_SDR_ID=0Fh
+
+# Control targets & dynamics (quiet defaults)
+#Environment=FANCTL_TARGET_C=65
+#Environment=FANCTL_DEADBAND_C=4
+#Environment=FANCTL_MIN_PCT=10
+#Environment=FANCTL_MAX_PCT=60
+#Environment=FANCTL_KP=2
+#Environment=FANCTL_KI_MILLI=0
+#Environment=FANCTL_SLEW_PCT=3
+#Environment=FANCTL_INTERVAL=20
+
+# Quiet cap (your request: ≤15% until ≥50°C)
+#Environment=FANCTL_LOW_CAP_C=50
+#Environment=FANCTL_LOW_CAP_MAX_PCT=15
+
 [Install]
 WantedBy=multi-user.target
 SERVICEEOF
 
-echo "[5/7] Reloading systemd..."
+echo "[5/5] Enabling and starting service..."
 systemctl daemon-reload
-
-echo "[6/7] Enabling and starting service..."
 systemctl enable --now "${SERVICE_NAME}"
 
-echo "[7/7] Done."
 echo
-echo "Service:       ${SERVICE_NAME}"
-echo "Script:        ${FAN_SCRIPT_PATH}"
-echo "Metrics file:  ${METRICS_FILE}"
-echo
-echo "Follow logs:   journalctl -u ${SERVICE_NAME} -f"
-echo "Check metrics: cat ${METRICS_FILE}"
+echo "Done."
+echo "Edit env overrides:  systemctl edit ${SERVICE_NAME}"
+echo "Logs (follow):       journalctl -u ${SERVICE_NAME} -f"
+echo "Metrics file:        ${METRICS_FILE}"
