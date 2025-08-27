@@ -28,6 +28,8 @@ CPU1_LABEL="${CPU1_LABEL:-CPU 1 Temp}"
 CPU2_LABEL="${CPU2_LABEL:-CPU 2 Temp}"
 IBM_BANK1="${IBM_BANK1:-0x01}"
 IBM_BANK2="${IBM_BANK2:-0x02}"
+# IBM mapping mode: "table" (default) or "linear"
+IBM_CODEMAP="${IBM_CODEMAP:-linear}"
 
 IPMI_CACHE="/tmp/ipmi_temp_cache.txt"
 
@@ -100,21 +102,29 @@ apply_slew() {
 # -------- IBM mapping (predefined step codes) --------
 ibm_hex_for_pct() {
   local p=$1
-  if   (( p <= 0 ));  then echo 0x12
-  elif (( p <= 25 )); then echo 0x30
-  elif (( p <= 30 )); then echo 0x35
-  elif (( p <= 35 )); then echo 0x3A
-  elif (( p <= 40 )); then echo 0x40
-  elif (( p <= 50 )); then echo 0x50
-  elif (( p <= 60 )); then echo 0x60
-  elif (( p <= 70 )); then echo 0x70
-  elif (( p <= 80 )); then echo 0x80
-  elif (( p <= 90 )); then echo 0x90
-  elif (( p <= 95 )); then echo 0xA0
-  else                   echo 0xFF
+  (( p<0 )) && p=0; (( p>100 )) && p=100
+  if [[ "$IBM_CODEMAP" = "linear" ]]; then
+    # Map 0..100% → 0x12..0xFF linearly (rounded)
+    local min_dec=$((16#12)) max_dec=$((16#FF))
+    local code=$(( min_dec + (p * (max_dec - min_dec) + 50) / 100 ))
+    printf "0x%02X\n" "$code"
+  else
+    # Safe step-table (classic IBM codes)
+    if   (( p <= 0 ));  then echo 0x12
+    elif (( p <= 25 )); then echo 0x30
+    elif (( p <= 30 )); then echo 0x35
+    elif (( p <= 35 )); then echo 0x3A
+    elif (( p <= 40 )); then echo 0x40
+    elif (( p <= 50 )); then echo 0x50
+    elif (( p <= 60 )); then echo 0x60
+    elif (( p <= 70 )); then echo 0x70
+    elif (( p <= 80 )); then echo 0x80
+    elif (( p <= 90 )); then echo 0x90
+    elif (( p <= 95 )); then echo 0xA0
+    else                   echo 0xFF
+    fi
   fi
 }
-
 # -------- Writers --------
 set_ibm_bank() { local bank="$1" pct="$2" hx; hx="$(ibm_hex_for_pct "$pct")"; ipmitool raw 0x3a 0x07 "$bank" "$hx" 0x01; }
 pct_to_hex()  { local p="$1"; (( p<0 )) && p=0; (( p>100 )) && p=100; printf "0x%02x" "$p"; }
