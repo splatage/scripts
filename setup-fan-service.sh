@@ -1,11 +1,7 @@
 #!/bin/bash
 # setup-fan-service.sh
-# Installs a target-temp (PI) fan controller with a quiet cap, Prometheus export, and a systemd service.
-# - IBM path: per-bank hex steps (your original mapping preserved)
-# - Dell/Unisys R720-class: global % duty (0x00–0x64) with manual/auto toggle
-# - Sensors: explicit by LABEL or SDR ID (no fuzzy guessing)
-# - Control: target temp with deadband, slew limit, min/max caps
-# - Quiet cap: keep PWM ≤ LOW_CAP_MAX_PCT while hottest CPU < LOW_CAP_C
+# Installs a target-temp (PI) fan controller with quiet-cap, IBM per-bank + Dell global,
+# IBM-safe IPMI calls, step stickiness (anti-drift), Prometheus export, systemd service.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -38,7 +34,7 @@ echo "[3/5] Installing ${FAN_SCRIPT_PATH}"
 install -m 0755 /dev/stdin "${FAN_SCRIPT_PATH}" <<'FANEOF'
 #!/bin/bash
 # fan_control.sh — target-temp PI controller with IBM/Dell paths + quiet cap
-# See systemd unit for environment overrides.
+# IBM path hardened: safe IPMI wrapper, step-stickiness to prevent audible drift.
 
 set -o errexit -o nounset -o pipefail
 IFS=$'\n\t'
@@ -53,9 +49,13 @@ CPU2_ID="${FANCTL_CPU2_SDR_ID:-}"
 CPU1_LABEL="${FANCTL_CPU1_LABEL:-CPU 1 Temp}"
 CPU2_LABEL="${FANCTL_CPU2_LABEL:-CPU 2 Temp}"
 
+# IBM bank IDs (override if your chassis maps differently)
+IBM_BANK1="${FANCTL_IBM_BANK1:-0x01}"
+IBM_BANK2="${FANCTL_IBM_BANK2:-0x02}"
+
 # Control loop
 INTERVAL="${FANCTL_INTERVAL:-30}"      # seconds between loops
-TARGET_C="${FANCTL_TARGET_C:-65}"      # desired CPU temperature (°C) — Xeon E5 under 70°C is OK
+TARGET_C="${FANCTL_TARGET_C:-65}"      # desired CPU temperature (°C)
 DEADBAND_C="${FANCTL_DEADBAND_C:-2}"   # ±°C around target where we back off
 MIN_PCT="${FANCTL_MIN_PCT:-10}"        # min PWM %
 MAX_PCT="${FANCTL_MAX_PCT:-80}"        # max PWM %
@@ -67,6 +67,12 @@ SLEW_PCT="${FANCTL_SLEW_PCT:-6}"       # max % change per loop
 LOW_CAP_C="${FANCTL_LOW_CAP_C:-50}"             # lift cap once hottest CPU ≥ this temp (°C)
 LOW_CAP_MAX_PCT="${FANCTL_LOW_CAP_MAX_PCT:-15}" # max % allowed below LOW_CAP_C
 # Tip: ensure MIN_PCT <= LOW_CAP_MAX_PCT for the cap to have effect.
+
+# IBM step stickiness (anti-drift between adjacent steps)
+IBM_STEP_STICKY_PCT="${FANCTL_IBM_STEP_STICKY_PCT:-3}"  # require ≥3% margin to switch steps
+
+# Debug logging (0/1)
+DEBUG="${FANCTL_DEBUG:-0}"
 
 # ---------------- IBM hex steps (preserved from your original) ----------------
 FAN_SPEED_0=0x12
@@ -115,6 +121,18 @@ echo "Vendor path: ${VENDOR}"
 # ---------------- IPMI helpers ----------------
 fetch_ipmi_data() { ipmitool sdr type temperature > "$IPMI_CACHE_FILE"; }
 
+# Safe IPMI wrapper (retry, don't crash the loop)
+safe_ipmi() {
+  # usage: safe_ipmi raw 0x.. 0x.. ...
+  if ipmitool "$@" >/dev/null 2>&1; then return 0; fi
+  sleep 0.2
+  if ipmitool "$@" >/dev/null 2>&1; then return 0; fi
+  sleep 0.5
+  if ipmitool "$@" >/dev/null 2>&1; then return 0; fi
+  [[ "$DEBUG" = "1" ]] && echo "WARN: ipmitool $* failed" >&2
+  return 1
+}
+
 # Read temp by SDR ID (2nd column like "0Eh"). Returns integer °C or empty.
 get_temp_by_sdr_id() {
   local id="$1"
@@ -128,40 +146,82 @@ get_temp_by_label() {
 }
 
 # ---------------- Percent/Hex mapping ----------------
-# For IBM, quantize UP to nearest supported step (safer than rounding down).
-hex_for_pct_ibm() {
-  local p=$1
-  if   (( p <= 0  )); then echo $FAN_SPEED_0
-  elif (( p <= 25 )); then echo $FAN_SPEED_25
-  elif (( p <= 30 )); then echo $FAN_SPEED_30
-  elif (( p <= 35 )); then echo $FAN_SPEED_35
-  elif (( p <= 40 )); then echo $FAN_SPEED_40
-  elif (( p <= 50 )); then echo $FAN_SPEED_50
-  elif (( p <= 60 )); then echo $FAN_SPEED_60
-  elif (( p <= 70 )); then echo $FAN_SPEED_70
-  elif (( p <= 80 )); then echo $FAN_SPEED_80
-  elif (( p <= 90 )); then echo $FAN_SPEED_90
-  elif (( p <= 95 )); then echo $FAN_SPEED_95
-  else                    echo $FAN_SPEED_100
-  fi
+# Nearest-up step (safety) — raw table -> hex
+hex_for_step_pct_ibm() {
+  local step=$1
+  case "$step" in
+    0) echo $FAN_SPEED_0 ;;
+    25) echo $FAN_SPEED_25 ;;
+    30) echo $FAN_SPEED_30 ;;
+    35) echo $FAN_SPEED_35 ;;
+    40) echo $FAN_SPEED_40 ;;
+    50) echo $FAN_SPEED_50 ;;
+    60) echo $FAN_SPEED_60 ;;
+    70) echo $FAN_SPEED_70 ;;
+    80) echo $FAN_SPEED_80 ;;
+    90) echo $FAN_SPEED_90 ;;
+    95) echo $FAN_SPEED_95 ;;
+    100) echo $FAN_SPEED_100 ;;
+    *) echo $FAN_SPEED_40 ;;
+  esac
 }
-pct_to_hex() { local p=$1; ((p<0))&&p=0; ((p>100))&&p=100; printf "0x%02x" "$p"; }
+# Quantize a % to IBM step with stickiness against toggling
+quantize_ibm_pct() {
+  local p="$1" last_step="$2"
+  # ceil to supported steps
+  local step
+  if   (( p <= 0  )); then step=0
+  elif (( p <= 25 )); then step=25
+  elif (( p <= 30 )); then step=30
+  elif (( p <= 35 )); then step=35
+  elif (( p <= 40 )); then step=40
+  elif (( p <= 50 )); then step=50
+  elif (( p <= 60 )); then step=60
+  elif (( p <= 70 )); then step=70
+  elif (( p <= 80 )); then step=80
+  elif (( p <= 90 )); then step=90
+  elif (( p <= 95 )); then step=95
+  else                    step=100
+  fi
+  # Stickiness: require margin to change from last_step
+  if [[ -n "$last_step" && "$last_step" -ne 0 ]]; then
+    if (( step > last_step )); then
+      # going up: require p >= last_step + IBM_STEP_STICKY_PCT
+      if (( p < last_step + IBM_STEP_STICKY_PCT )); then step="$last_step"; fi
+    elif (( step < last_step )); then
+      # going down: require p <= step - IBM_STEP_STICKY_PCT
+      if (( p > step - IBM_STEP_STICKY_PCT )); then step="$last_step"; fi
+    fi
+  fi
+  echo "$step"
+}
+
+pct_to_hex_dell() { local p=$1; ((p<0))&&p=0; ((p>100))&&p=100; printf "0x%02x" "$p"; }
 
 # ---------------- Command writers ----------------
-# IBM per-bank
+# IBM per-bank (safe wrapper + debug)
 ibm_set_bank_pct() {
-  local bank="$1" pct="$2"
-  local hx; hx="$(hex_for_pct_ibm "$pct")"
-  ipmitool raw 0x3a 0x07 "$bank" "$hx" 0x01 >/dev/null
+  local bank="$1" pct="$2" step="$3" hx
+  hx="$(hex_for_step_pct_ibm "$step")"
+  if [[ "$DEBUG" = "1" ]]; then
+    echo "IBM set bank ${bank}: pct=${pct}% -> step=${step}% -> hex=${hx}"
+  fi
+  if ! safe_ipmi raw 0x3a 0x07 "$bank" "$hx" 0x01; then
+    echo "WARN: IBM set bank ${bank} failed (pct=${pct} step=${step})" >&2
+  fi
 }
 
-# Dell/Unisys global with manual/auto
+# Dell/Unisys global with manual/auto (safe wrapper + debug)
 dell_manual=0
-dell_enter_manual() { ipmitool raw 0x30 0x30 0x01 0x00 >/dev/null || true; dell_manual=1; }
-dell_restore_auto() { ipmitool raw 0x30 0x30 0x01 0x01 >/dev/null || true; }
+dell_enter_manual() {
+  safe_ipmi raw 0x30 0x30 0x01 0x00 || true
+  dell_manual=1
+}
+dell_restore_auto() { safe_ipmi raw 0x30 0x30 0x01 0x01 || true; }
 dell_set_pct() {
-  local pct="$1"; local hx; hx="$(pct_to_hex "$pct")"
-  ipmitool raw 0x30 0x30 0x02 0xff "$hx" >/dev/null
+  local pct="$1"; local hx; hx="$(pct_to_hex_dell "$pct")"
+  [[ "$DEBUG" = "1" ]] && echo "Dell set global: pct=${pct}% hex=${hx}"
+  safe_ipmi raw 0x30 0x30 0x02 0xff "$hx" || true
 }
 
 cleanup() {
@@ -172,8 +232,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ---------------- PI Controller ----------------
-LAST1=0; LAST2=0; LASTG=0
+LAST1=0; LAST2=0; LASTG=0           # last applied % (IBM uses step % here)
 IERR1=0; IERR2=0; IERRG=0
+LAST1_STEP=""; LAST2_STEP=""         # last IBM step % (for stickiness)
 
 clamp() { local v=$1 lo=$2 hi=$3; (( v<lo )) && v=$lo; (( v>hi )) && v=$hi; echo "$v"; }
 
@@ -227,6 +288,19 @@ compute_next_pct() {
 }
 
 # ---------------- Main ----------------
+# Vendor detect (simple) if not set
+detect_vendor_simple() {
+  local man prod base
+  man="$(dmidecode -s system-manufacturer 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  prod="$(dmidecode -s system-product-name 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  base="$(dmidecode -s baseboard-manufacturer 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+  local s="${man} ${base} ::: ${prod}"
+  if echo "$s" | grep -Eq 'dell|emc|unisys'; then echo dell
+  elif echo "$s" | grep -Eq 'ibm|lenovo'; then echo ibm
+  else echo ibm; fi
+}
+if [[ -z "$VENDOR" ]]; then VENDOR="$(detect_vendor_simple)"; fi
+echo "Vendor path: ${VENDOR}"
 if [[ "$VENDOR" == "dell" ]]; then
   echo "Entering manual fan control (Dell-class)..."; dell_enter_manual
 fi
@@ -247,19 +321,25 @@ while true; do
   fi
 
   if [[ "$VENDOR" == "ibm" ]]; then
-    # Per-bank control
+    # Per-bank control with IBM step stickiness
     if [[ -n "$CPU1_TEMP" ]]; then
-      LAST1="$(compute_next_pct "$CPU1_TEMP" "$LAST1" IERR1)"
-      ibm_set_bank_pct 0x01 "$LAST1"
+      local_want="$(compute_next_pct "$CPU1_TEMP" "$LAST1" IERR1)"
+      # convert to sticky IBM step %
+      NEXT1_STEP="$(quantize_ibm_pct "$local_want" "${LAST1_STEP:-}")"
+      LAST1="$NEXT1_STEP"; LAST1_STEP="$NEXT1_STEP"
+      ibm_set_bank_pct "$IBM_BANK1" "$local_want" "$NEXT1_STEP"
     fi
     if [[ -n "$CPU2_TEMP" ]]; then
-      LAST2="$(compute_next_pct "$CPU2_TEMP" "$LAST2" IERR2)"
-      ibm_set_bank_pct 0x02 "$LAST2"
+      local_want2="$(compute_next_pct "$CPU2_TEMP" "$LAST2" IERR2)"
+      NEXT2_STEP="$(quantize_ibm_pct "$local_want2" "${LAST2_STEP:-}")"
+      LAST2="$NEXT2_STEP"; LAST2_STEP="$NEXT2_STEP"
+      ibm_set_bank_pct "$IBM_BANK2" "$local_want2" "$NEXT2_STEP"
     fi
   else
     # Global (Dell/Unisys): regulate to hottest CPU
     HOT=$(( ${CPU1_TEMP:-0} > ${CPU2_TEMP:-0} ? ${CPU1_TEMP:-0} : ${CPU2_TEMP:-0} ))
-    LASTG="$(compute_next_pct "$HOT" "$LASTG" IERRG)"
+    local_wantg="$(compute_next_pct "$HOT" "$LASTG" IERRG)"
+    LASTG="$local_wantg"
     dell_set_pct "$LASTG"
   fi
 
@@ -270,7 +350,7 @@ while true; do
   echo "CPU 1 (${CPU1_ID:-$CPU1_LABEL}): ${CPU1_TEMP:-N/A}°C"
   echo "CPU 2 (${CPU2_ID:-$CPU2_LABEL}): ${CPU2_TEMP:-N/A}°C"
   if [[ "$VENDOR" == "ibm" ]]; then
-    echo "Applied IBM per-bank: Bank1=${LAST1}% Bank2=${LAST2}%"
+    echo "Applied IBM per-bank: Bank1=${LAST1}% Bank2=${LAST2}% (sticky ±${IBM_STEP_STICKY_PCT}%)"
   else
     echo "Applied Dell global: ${LASTG}% (hot=${HOT}°C)"
   fi
@@ -292,8 +372,8 @@ while true; do
     echo "fanctl_low_cap_c ${LOW_CAP_C}"
     echo "fanctl_low_cap_max_pct ${LOW_CAP_MAX_PCT}"
     if [[ "$VENDOR" == "ibm" ]]; then
-      echo "fanctl_fan1_pct ${LAST1}"
-      echo "fanctl_fan2_pct ${LAST2}"
+      echo "fanctl_fan1_step_pct ${LAST1}"
+      echo "fanctl_fan2_step_pct ${LAST2}"
     else
       echo "fanctl_fan_global_pct ${LASTG}"
     fi
@@ -331,6 +411,9 @@ PrivateTmp=yes
 # IBM labels (typical):
 #Environment=FANCTL_CPU1_LABEL=CPU\ 1\ Temp
 #Environment=FANCTL_CPU2_LABEL=CPU\ 2\ Temp
+# IBM bank overrides (if needed):
+#Environment=FANCTL_IBM_BANK1=0x01
+#Environment=FANCTL_IBM_BANK2=0x02
 
 # Dell/Unisys (use SDR IDs to disambiguate generic "Temp"):
 #Environment=FANCTL_CPU1_SDR_ID=0Eh
@@ -346,9 +429,15 @@ PrivateTmp=yes
 #Environment=FANCTL_SLEW_PCT=3
 #Environment=FANCTL_INTERVAL=20
 
-# Quiet cap (your request: ≤15% until ≥50°C)
+# Quiet cap (≤15% until hottest CPU ≥ 50°C)
 #Environment=FANCTL_LOW_CAP_C=50
 #Environment=FANCTL_LOW_CAP_MAX_PCT=15
+
+# IBM anti-drift (step stickiness, default 3%)
+#Environment=FANCTL_IBM_STEP_STICKY_PCT=3
+
+# Debug logs
+#Environment=FANCTL_DEBUG=1
 
 [Install]
 WantedBy=multi-user.target
