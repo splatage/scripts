@@ -3,6 +3,10 @@
 # Minimal reactive fan controller for IBM (step codes) and Dell/Unisys (percent).
 # Logic per 30s tick: +5% per +1°C, -1% per -1°C vs last reading, clamped and slewed.
 # IBM uses required predefined step codes; Dell/Unisys accepts a true percent.
+# Fan control at boot (sleep to let BMC/IPMI come up)
+# @reboot sleep 30 && /usr/bin/flock -n /var/run/fan_control.lock -c "BASELINE_C=50 UP_GAIN=5 DOWN_GAIN=1 MIN_PCT=0 MAX_PCT=60 SLEW_PCT=15 /root/fan_control_simple.sh >> /var/log/fan_control.log 2>&1"
+
+
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 touch /var/log/fan_control.log && chown root:adm /var/log/fan_control.log
