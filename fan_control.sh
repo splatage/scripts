@@ -16,7 +16,7 @@ IFS=$'\n\t'
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # ------------ single-instance lock ------------
-LOCKFILE="/var/run/fan_control_simple.lock"
+LOCKFILE="/var/run/fan_control.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
   echo "[$(date +'%F %T')] already running (lock $LOCKFILE). Exiting. PID=$$"
