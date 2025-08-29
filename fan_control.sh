@@ -1,4 +1,41 @@
 #!/bin/bash
+# setup-fan-service.sh
+# Installs /usr/local/sbin/fan_control.sh and a simple systemd unit with optional env overrides.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_PATH="/usr/local/sbin/fan_control.sh"
+SERVICE_PATH="/etc/systemd/system/fan-control.service"
+DEFAULTS_PATH="/etc/default/fan-control"
+
+need_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Please run as root (sudo)." >&2
+    exit 1
+  fi
+}
+
+install_deps() {
+  # Best-effort: install ipmitool and dmidecode if using a common package manager
+  local pkgs=(ipmitool dmidecode)
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y "${pkgs[@]}"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y "${pkgs[@]}"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "${pkgs[@]}"
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper install -y "${pkgs[@]}"
+  else
+    echo "NOTE: Could not detect a supported package manager. Ensure these are installed: ${pkgs[*]}" >&2
+  fi
+}
+
+write_script() {
+  install -m 0755 /dev/stdin "${SCRIPT_PATH}" <<'FANEOF'
+#!/bin/bash
 # /usr/local/sbin/fan_control.sh
 # Baseline-referenced fan control for IBM (step or linear hex) and Dell/Unisys (percent).
 # pct each cycle is based on TEMP vs BASELINE (not last delta), then clamped & slewed.
@@ -50,18 +87,14 @@ echo "[$(date +'%F %T')] start vendor=$VENDOR baseline=${BASELINE_C}C IBM_CODEMA
 # ------------ IPMI read & parsers ------------
 fetch_ipmi(){ ipmitool sdr type temperature > "$IPMI_CACHE"; }
 
-# IBM basic CPU temps: your simple pipeline
-# - select lines with "CPU" anywhere
-# - field 5 contains "NN degrees C" (or "No Reading"/"Transition ...")
-# - strip non-digits; drop empties
+# IBM basic CPU temps: simple /CPU/ grep → field 5 → digits only → hottest
 ibm_hot_cpu_temp(){
   awk -F'|' '/CPU/ {print $5}' "$IPMI_CACHE" \
   | sed -E 's/[^0-9]+//g;/^$/d' \
   | awk 'BEGIN{m=-1} {n=$1+0; if(n>m)m=n} END{if(m>=0)print m}'
 }
 
-# IBM bank presence: does CPU1/CPU2 have a *real* reading?
-# (filters out "No Reading" and "Transition to OK")
+# IBM bank presence: CPU1/CPU2 with real reading
 ibm_have_cpu1(){
   awk -F'|' '($1 ~ /CPU[[:space:]]*1|CPU1/) && ($1 ~ /Temp/) && ($5 !~ /No Reading|Transition/) {f=1}
              END{if(f)print 1}' "$IPMI_CACHE"
@@ -192,3 +225,83 @@ while true; do
 
   sleep "$INTERVAL"
 done
+FANEOF
+}
+
+write_defaults() {
+  cat > "${DEFAULTS_PATH}" <<'DFEOF'
+# /etc/default/fan-control
+# Override environment variables for fan_control.service here.
+# Remove the leading '#' to activate a setting; defaults are in the script.
+
+#INTERVAL=30
+#BASELINE_C=45
+#UP_GAIN=2
+#DOWN_GAIN=1
+#MIN_PCT=0
+#MAX_PCT=60
+#SLEW_PCT=15
+#DEADBAND_C=0
+
+# IBM mapping: "table" (classic steps) or "linear" (0x12..0xFF)
+#IBM_CODEMAP=linear
+
+# IBM banks (usually fine as-is)
+#IBM_BANK1=0x01
+#IBM_BANK2=0x02
+DFEOF
+  chmod 0644 "${DEFAULTS_PATH}"
+}
+
+write_service() {
+  cat > "${SERVICE_PATH}" <<SVC
+[Unit]
+Description=Baseline-reactive Fan Control (IBM & Dell/Unisys)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=${SCRIPT_PATH}
+EnvironmentFile=-${DEFAULTS_PATH}
+Restart=always
+RestartSec=3
+User=root
+
+# Keep hardening minimal to avoid blocking ipmitool access
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC
+}
+
+enable_service() {
+  systemctl daemon-reload
+  systemctl enable --now fan-control.service
+}
+
+summary() {
+  echo
+  echo "Installed:"
+  echo "  Script : ${SCRIPT_PATH}"
+  echo "  Service: ${SERVICE_PATH}"
+  echo "  Env    : ${DEFAULTS_PATH} (edit to tweak settings)"
+  echo
+  echo "Commands:"
+  echo "  journalctl -u fan-control.service -f"
+  echo "  sudo systemctl edit fan-control.service      # add overrides (optional)"
+  echo "  sudo systemctl restart fan-control.service"
+}
+
+main() {
+  need_root
+  install_deps
+  write_script
+  write_defaults
+  write_service
+  enable_service
+  summary
+}
+
+main "$@"
