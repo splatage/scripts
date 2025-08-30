@@ -9,7 +9,7 @@ Type=simple
 User=tradebid
 WorkingDirectory=/home/tradebid/tradebidder/backend
 
-Environment=PATH=/home/tradebid/.nvm/versions/node/v22.16.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/home/tradebid/.nvm/versions/node/v22.19.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
 Environment=PM2_HOME=/home/tradebid/.pm2
 
@@ -17,8 +17,8 @@ Environment=PM2_HOME=/home/tradebid/.pm2
 ExecStartPre=/bin/sleep 90
 
 # Run pm2 in foreground so systemd supervises it
-ExecStart=/home/tradebid/.nvm/versions/node/v22.16.0/bin/pm2-runtime /home/tradebid/tradebidder/backend/ecosystem.config.cjs
-ExecStop=/home/tradebid/.nvm/versions/node/v22.16.0/bin/pm2 kill
+ExecStart=/home/tradebid/.nvm/versions/node/v22.19.0/bin/pm2-runtime /home/tradebid/tradebidder/backend/ecosystem.config.cjs
+ExecStop=/home/tradebid/.nvm/versions/node/v22.19.0/bin/pm2 kill
 
 Restart=always
 RestartSec=5
