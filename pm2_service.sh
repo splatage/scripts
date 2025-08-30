@@ -34,3 +34,17 @@ ReadWritePaths=/home/tradebid/.pm2 /home/tradebid/tradebidder
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+echo "
+Apply and start:
+
+sudo systemctl daemon-reload
+sudo systemctl enable tradebidder-backend.service
+sudo systemctl start tradebidder-backend.service
+
+Quick checks:
+
+systemctl status tradebidder-backend.service
+journalctl -u tradebidder-backend.service -f
+"
+
