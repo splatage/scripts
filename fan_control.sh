@@ -61,7 +61,7 @@ INTERVAL=${INTERVAL:-30}        # seconds
 BASELINE_C=${BASELINE_C:-45}    # target "quiet" °C
 UP_GAIN=${UP_GAIN:-2}           # % per +1°C above baseline
 DOWN_GAIN=${DOWN_GAIN:-1}       # % per -1°C below baseline
-MIN_PCT=${MIN_PCT:-0}           # min %
+MIN_PCT=${MIN_PCT:-5}           # min %
 MAX_PCT=${MAX_PCT:-60}          # max %
 SLEW_PCT=${SLEW_PCT:-15}        # per-cycle max % change (0=off)
 DEADBAND_C=${DEADBAND_C:-0}     # °C around baseline to keep MIN_PCT (0=off)
