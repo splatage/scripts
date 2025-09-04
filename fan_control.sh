@@ -94,7 +94,7 @@ fetch_ipmi(){
 # ------------ parsers using in-memory SDR ------------
 # Hottest temperature anywhere in SDR (robust numeric parse of last field)
 hottest_temp_any(){
-  awk -F'|' '{print $NF}' <<< "$SDR" \
+  awk -F'|' '!/PCH/ {print $NF}' <<< "$SDR" \
   | sed -E 's/[^0-9.]//g;/^$/d' \
   | sort -n | tail -n 1 \
   | awk '{printf "%d\n", ($1+0)}'
