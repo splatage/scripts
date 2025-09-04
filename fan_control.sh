@@ -38,8 +38,10 @@ write_script() {
 #!/bin/bash
 # /usr/local/sbin/fan_control.sh
 # Baseline-referenced fan control for IBM (step or linear hex) and Dell/Unisys (percent).
-# pct each cycle is based on TEMP vs BASELINE (not last delta), then clamped & slewed.
-# IBM_CODEMAP: "table" (default, classic codes) or "linear" (0x12..0xFF).
+# - Takes ONE SDR snapshot per loop and keeps it IN MEMORY (no /tmp cache).
+# - Uses the HOTTEST temperature reported by SDR to drive the fans.
+# - pct each cycle is based on TEMP vs BASELINE (not last delta), then clamped & slewed.
+# - IBM_CODEMAP: "table" (classic) or "linear" (0x12..0xFF).
 
 set -u -o pipefail
 IFS=$'\n\t'
@@ -58,7 +60,7 @@ INTERVAL=${INTERVAL:-30}        # seconds
 BASELINE_C=${BASELINE_C:-45}    # target "quiet" °C
 UP_GAIN=${UP_GAIN:-2}           # % per +1°C above baseline
 DOWN_GAIN=${DOWN_GAIN:-1}       # % per -1°C below baseline
-MIN_PCT=${MIN_PCT:-0}          # min %
+MIN_PCT=${MIN_PCT:-0}           # min %
 MAX_PCT=${MAX_PCT:-60}          # max %
 SLEW_PCT=${SLEW_PCT:-15}        # per-cycle max % change (0=off)
 DEADBAND_C=${DEADBAND_C:-0}     # °C around baseline to keep MIN_PCT (0=off)
@@ -66,8 +68,6 @@ DEADBAND_C=${DEADBAND_C:-0}     # °C around baseline to keep MIN_PCT (0=off)
 IBM_CODEMAP="${IBM_CODEMAP:-linear}"  # table|linear
 IBM_BANK1="${IBM_BANK1:-0x01}"
 IBM_BANK2="${IBM_BANK2:-0x02}"
-
-IPMI_CACHE="/tmp/ipmi_temp_cache.txt"
 
 # ------------ vendor detect ------------
 lower(){ tr '[:upper:]' '[:lower:]'; }
@@ -84,39 +84,29 @@ detect_vendor() {
 VENDOR="$(detect_vendor)"
 echo "[$(date +'%F %T')] start vendor=$VENDOR baseline=${BASELINE_C}C IBM_CODEMAP=${IBM_CODEMAP}"
 
-# ------------ IPMI read & parsers ------------
-fetch_ipmi(){ ipmitool sdr type temperature > "$IPMI_CACHE"; }
-
-# IBM basic CPU temps: simple /CPU/ grep → field 5 → digits only → hottest
-ibm_hot_cpu_temp(){
-  awk -F'|' '/CPU/ {print $5}' "$IPMI_CACHE" \
-  | sed -E 's/[^0-9]+//g;/^$/d' \
-  | awk 'BEGIN{m=-1} {n=$1+0; if(n>m)m=n} END{if(m>=0)print m}'
+# ------------ SDR snapshot (in memory) ------------
+SDR=""
+fetch_ipmi(){
+  SDR="$(ipmitool sdr type temperature 2>/dev/null)" && [[ -n "$SDR" ]]
 }
 
-# IBM bank presence: CPU1/CPU2 with real reading
+# ------------ parsers using in-memory SDR ------------
+# Hottest temperature anywhere in SDR (your simple method, robustified)
+hottest_temp_any(){
+  awk -F'|' '{print $NF}' <<< "$SDR" \
+  | sed -E 's/[^0-9.]//g;/^$/d' \
+  | sort -n | tail -n 1 \
+  | awk '{printf "%d\n", ($1+0)}'
+}
+
+# IBM bank presence: CPU1/CPU2 with a real temperature reading
 ibm_have_cpu1(){
-  awk -F'|' '($1 ~ /CPU[[:space:]]*1|CPU1/) && ($1 ~ /Temp/) && ($5 !~ /No Reading|Transition/) {f=1}
-             END{if(f)print 1}' "$IPMI_CACHE"
+  awk -F'|' '($1 ~ /CPU[[:space:]]*1|CPU1/) && ($1 ~ /Temp/) && ($5 ~ /degrees[[:space:]]*C/i) {f=1}
+             END{if(f)print 1}' <<< "$SDR"
 }
 ibm_have_cpu2(){
-  awk -F'|' '($1 ~ /CPU[[:space:]]*2|CPU2/) && ($1 ~ /Temp/) && ($5 !~ /No Reading|Transition/) {f=1}
-             END{if(f)print 1}' "$IPMI_CACHE"
-}
-
-# Dell/Unisys: hottest sensible sensor (ignore inlet/exhaust/ambient/VR/DIMM/PSU/etc.)
-get_hottest_temp_generic(){
-  awk -F'|' '
-    BEGIN{IGNORECASE=1; max=-1}
-    {
-      lab=$1; gsub(/^[ \t]+|[ \t]+$/,"",lab)
-      val=$5; gsub(/[^0-9.]/,"",val)
-      if (val=="") next
-      if (lab ~ /(inlet|exhaust|ambient|pch|vr|vreg|dimm|psu|supply|backplane|board|system)/) next
-      n=int(val+0)
-      if (n>max) max=n
-    }
-    END{ if (max>=0) print max }' "$IPMI_CACHE"
+  awk -F'|' '($1 ~ /CPU[[:space:]]*2|CPU2/) && ($1 ~ /Temp/) && ($5 ~ /degrees[[:space:]]*C/i) {f=1}
+             END{if(f)print 1}' <<< "$SDR"
 }
 
 # ------------ % helpers ------------
@@ -193,32 +183,23 @@ while true; do
     sleep "$INTERVAL"; continue
   fi
 
+  # unified hottest-sensor drive
+  HOT="$(hottest_temp_any)"
+  if [[ -z "${HOT:-}" ]]; then
+    echo "[$(date +'%F %T')] No temperature parsed from SDR; retrying..."
+    sleep "$INTERVAL"; continue
+  fi
+
+  WANT="$(compute_from_baseline "$HOT")"
+  CUR_PCT="$(apply_slew "$CUR_PCT" "$WANT")"
+
   if [[ "$VENDOR" == "ibm" ]]; then
-    HOT="$(ibm_hot_cpu_temp || true)"
-    if [[ -z "${HOT:-}" ]]; then
-      echo "[$(date +'%F %T')] IBM: no CPU temps (from /CPU/); retrying..."
-      sleep "$INTERVAL"; continue
-    fi
-
-    WANT="$(compute_from_baseline "$HOT")"
-    CUR_PCT="$(apply_slew "$CUR_PCT" "$WANT")"
-
     HAVE1="$(ibm_have_cpu1 || true)"
     HAVE2="$(ibm_have_cpu2 || true)"
     [[ -n "$HAVE1" ]] && set_ibm_bank "$IBM_BANK1" "$CUR_PCT"
     [[ -n "$HAVE2" ]] && set_ibm_bank "$IBM_BANK2" "$CUR_PCT"
-
     echo "[$(date +'%F %T')] IBM: HOT=${HOT}°C -> ${CUR_PCT}% (map=${IBM_CODEMAP}) banks=$([[ -n "$HAVE1" ]] && echo 1)$( [[ -n "$HAVE2" ]] && echo 2)"
-
   else
-    HOT="$(get_hottest_temp_generic)"
-    if [[ -z "${HOT:-}" ]]; then
-      echo "[$(date +'%F %T')] Dell/clone: no sensible temp; retrying..."
-      sleep "$INTERVAL"; continue
-    fi
-
-    WANT="$(compute_from_baseline "$HOT")"
-    CUR_PCT="$(apply_slew "$CUR_PCT" "$WANT")"
     set_dell_global "$CUR_PCT"
     echo "[$(date +'%F %T')] Dell/clone: HOT=${HOT}°C -> ${CUR_PCT}%"
   fi
