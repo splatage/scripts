@@ -40,6 +40,7 @@ write_script() {
 # Baseline-referenced fan control for IBM (step or linear hex) and Dell/Unisys (percent).
 # - Takes ONE SDR snapshot per loop and keeps it IN MEMORY (no /tmp cache).
 # - Uses the HOTTEST temperature reported by SDR to drive the fans.
+# - Reissues current speed just BEFORE each read (keepalive) to prevent BMC ramp.
 # - pct each cycle is based on TEMP vs BASELINE (not last delta), then clamped & slewed.
 # - IBM_CODEMAP: "table" (classic) or "linear" (0x12..0xFF).
 
@@ -91,7 +92,7 @@ fetch_ipmi(){
 }
 
 # ------------ parsers using in-memory SDR ------------
-# Hottest temperature anywhere in SDR (your simple method, robustified)
+# Hottest temperature anywhere in SDR (robust numeric parse of last field)
 hottest_temp_any(){
   awk -F'|' '{print $NF}' <<< "$SDR" \
   | sed -E 's/[^0-9.]//g;/^$/d' \
@@ -178,6 +179,15 @@ CUR_PCT="$MIN_PCT"
 
 # ------------ main loop ------------
 while true; do
+  # Re-assert current speed BEFORE reading sensors (pre-check keepalive)
+  if [[ "$VENDOR" == "ibm" ]]; then
+    HX_KEEP="$(ibm_hex_for_pct "$CUR_PCT")"
+    ipmitool raw 0x3a 0x07 "$IBM_BANK1" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
+    ipmitool raw 0x3a 0x07 "$IBM_BANK2" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
+  else
+    set_dell_global "$CUR_PCT" >/dev/null 2>&1 || true
+  fi
+
   if ! fetch_ipmi; then
     echo "[$(date +'%F %T')] IPMI read failed; retrying..."
     sleep "$INTERVAL"; continue
