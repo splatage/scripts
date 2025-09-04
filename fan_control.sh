@@ -179,21 +179,28 @@ CUR_PCT="$MIN_PCT"
 
 # ------------ main loop ------------
 while true; do
-  # Re-assert current speed BEFORE reading sensors (pre-check keepalive)
-  if [[ "$VENDOR" == "ibm" ]]; then
-    HX_KEEP="$(ibm_hex_for_pct "$CUR_PCT")"
-    ipmitool raw 0x3a 0x07 "$IBM_BANK1" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
-    # ipmitool raw 0x3a 0x07 "$IBM_BANK2" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
-  else
-    set_dell_global "$CUR_PCT" >/dev/null 2>&1 || true
-  fi
-
+  # 1) Read SDR
   if ! fetch_ipmi; then
     echo "[$(date +'%F %T')] IPMI read failed; retrying..."
     sleep "$INTERVAL"; continue
   fi
 
-  # unified hottest-sensor drive
+  # 2) Learn which IBM banks exist from THIS snapshot
+  if [[ "$VENDOR" == "ibm" ]]; then
+    HAVE1="$(ibm_have_cpu1 || true)"
+    HAVE2="$(ibm_have_cpu2 || true)"
+  fi
+
+  # 3) Post-read keepalive: immediately re-assert current speed (mirrors your manual workflow)
+  if [[ "$VENDOR" == "ibm" ]]; then
+    HX_KEEP="$(ibm_hex_for_pct "$CUR_PCT")"
+    [[ -n "$HAVE1" ]] && ipmitool raw 0x3a 0x07 "$IBM_BANK1" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
+    [[ -n "$HAVE2" ]] && ipmitool raw 0x3a 0x07 "$IBM_BANK2" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
+  else
+    set_dell_global "$CUR_PCT" >/dev/null 2>&1 || true
+  fi
+
+  # 4) Parse hottest temp, compute and set new target
   HOT="$(hottest_temp_any)"
   if [[ -z "${HOT:-}" ]]; then
     echo "[$(date +'%F %T')] No temperature parsed from SDR; retrying..."
@@ -204,10 +211,8 @@ while true; do
   CUR_PCT="$(apply_slew "$CUR_PCT" "$WANT")"
 
   if [[ "$VENDOR" == "ibm" ]]; then
-    HAVE1="$(ibm_have_cpu1 || true)"
-   # HAVE2="$(ibm_have_cpu2 || true)"
     [[ -n "$HAVE1" ]] && set_ibm_bank "$IBM_BANK1" "$CUR_PCT"
-   # [[ -n "$HAVE2" ]] && set_ibm_bank "$IBM_BANK2" "$CUR_PCT"
+    [[ -n "$HAVE2" ]] && set_ibm_bank "$IBM_BANK2" "$CUR_PCT"
     echo "[$(date +'%F %T')] IBM: HOT=${HOT}°C -> ${CUR_PCT}% (map=${IBM_CODEMAP}) banks=$([[ -n "$HAVE1" ]] && echo 1)$( [[ -n "$HAVE2" ]] && echo 2)"
   else
     set_dell_global "$CUR_PCT"
