@@ -183,7 +183,7 @@ while true; do
   if [[ "$VENDOR" == "ibm" ]]; then
     HX_KEEP="$(ibm_hex_for_pct "$CUR_PCT")"
     ipmitool raw 0x3a 0x07 "$IBM_BANK1" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
-    ipmitool raw 0x3a 0x07 "$IBM_BANK2" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
+    # ipmitool raw 0x3a 0x07 "$IBM_BANK2" "$HX_KEEP" 0x01 >/dev/null 2>&1 || true
   else
     set_dell_global "$CUR_PCT" >/dev/null 2>&1 || true
   fi
@@ -205,9 +205,9 @@ while true; do
 
   if [[ "$VENDOR" == "ibm" ]]; then
     HAVE1="$(ibm_have_cpu1 || true)"
-    HAVE2="$(ibm_have_cpu2 || true)"
+   # HAVE2="$(ibm_have_cpu2 || true)"
     [[ -n "$HAVE1" ]] && set_ibm_bank "$IBM_BANK1" "$CUR_PCT"
-    [[ -n "$HAVE2" ]] && set_ibm_bank "$IBM_BANK2" "$CUR_PCT"
+   # [[ -n "$HAVE2" ]] && set_ibm_bank "$IBM_BANK2" "$CUR_PCT"
     echo "[$(date +'%F %T')] IBM: HOT=${HOT}°C -> ${CUR_PCT}% (map=${IBM_CODEMAP}) banks=$([[ -n "$HAVE1" ]] && echo 1)$( [[ -n "$HAVE2" ]] && echo 2)"
   else
     set_dell_global "$CUR_PCT"
